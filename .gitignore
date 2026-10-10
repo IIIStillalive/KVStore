@@ -1,0 +1,15 @@
+# build / 中间产物
+build/
+out/
+my_design/include/
+# MSVC / VS 工程
+.vs/
+
+# 单测 / bench 可执行
+*.exe
+*.obj
+*.o
+*.pdb
+
+# 本地状态
+*.wal
