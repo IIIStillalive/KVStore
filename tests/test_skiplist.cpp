@@ -9,7 +9,7 @@
 using kv::SkipList;
 
 int main() {
-  SkipList<int, std::string> sl(1u << 16);
+  SkipList<int, std::string> sl;
 
   // 1) 插入后 get 命中 / 未命中
   CHECK(sl.insert(3, "three"));

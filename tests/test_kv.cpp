@@ -20,7 +20,7 @@ int main() {
   std::uniform_int_distribution<int> key(-1000, 1000);
   std::uniform_int_distribution<int> val(0, 999);
 
-  SkipList<int, int> sl(1u << 10);
+  SkipList<int, int> sl;
   std::map<int, int> ref;  // 对照基准
 
   // 每个 op 同步作用于 sl 与 ref，断言结果完全一致。
