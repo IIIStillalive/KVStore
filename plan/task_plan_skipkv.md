@@ -1,25 +1,49 @@
 # SkipList 内存 KV 存储引擎 — 实现方案（独立仓库 kv-engine）
 
-状态：`[已建库落地，Day1 进行中 — 待用户手写跳表实现]`
+状态：`[Day1 ✅ 跳表全绿 · Day2 ✅ WAL 全绿 · Day3 ✅ 完成（Windows ×3 + WSL2 TSAN 零竞争报告）→ Day4：bench + README]`
 目标：3–5 天。用户手写核心代码、边写边学；Claude 负责 分层设计 / Review / 排障。
 存放：**独立 Git 仓库**已在本机 F:\C++项目\kv-engine 建好（本文件已在该仓库 `plan/`）。
 
 ---
 
-## 进度记录（2026-10-08 更新）
-- 已建库落地：目录结构 / CMakeLists / .gitignore / README 骨架 建立完毕。
-- 已交付接口层：`include/kv/skiplist.hpp`、`wal.hpp`、`kv_store.hpp` + `src/wal.cpp`、`src/kv_store.cpp` 骨架。
-- 已交付测试脚手架：`tests/{test_skiplist,test_kv,test_recovery,test_concurrency}.cpp` + `tests/test_util.h`。
-- 四个测试均**可编译，当前为「红」**（算法 stub 未实现，首条 CHECK 即 abort）。
-- build 工具：本机有 `g++ 8.1.0`（MinGW）；**cmake 不在 PATH** —— 若要用 `ctest/TSAN`，需先装 cmake 或改用直连 g++ 编译单测。
+## 进度记录（2026-10-14 更新）
+- **层① 完成 ✅**：skiplist.hpp 全部算法由用户手写（randomLevel / updatePrev / insert / find / erase / range / 析构）。
+  - `test_skiplist`（结构单测）→ OK；`test_kv`（10 万随机 op 对照 std::map 金标准）种子 12345 / 6174 / 987654 全绿。
+  - 遍历轮次修复要点：相等 key 前进条件（advance-on-`<`）、下沉不横移、新层前驱填 `prev[k]=head_`、连接上界 `min(newlevel,currentlevel)`、析构无双重释放。
+- 已提交并 push（用户操作 git）。
+- 注：层高最终定案为**固定 32@p=1/4（对齐 Redis ZSet）**，覆盖了本节 §2 早期「随容量推算 maxLevel」的做法；以 `my_design/final/kv/skiplist.hpp` 为权威（此更新如上轮评审确定）。
+- **层② WAL 完成 ✅**：`recover`（坏尾 CRC 截断 + EOF 标记跨会话跳过 + F9 物理裁剪）由 Claude 实现，经 5 场景 scratch 全绿；`open/append/close/flush/is_open/析构` 由 Claude 补齐写侧句柄（`FILE*`「ab」+ 真落盘 `fflush`+`fsync`/`_commit`）；`file_size` 由用户实现（ifstream seek/tell）。`test_recovery` 三块全绿（干净重启重放 / 崩溃重放 / 坏尾截断）。
+  - 踩坑记录：recover 初版两个布局错位 bug（valLen 按固定偏移读、crc 偏移漏 valLen 字段位）——已改为按字段序列位置推导；`<filesystem>` 头文件在 MinGW g++8.1 自身编译不过（fs_path.h operator!=），弃用。
+  - 待办（P2，可选）：append 的 output_buff → 队刷线程（condition_variable）异步落盘；SyncMode 三态的外围定时器编排在 KvStore 层接线。
 
-### 交给你手写的下一步（Day1，P0）
-1. `skiplist.hpp`：填 `randomLevel()` / `updatePrev()` / `insert / find / erase / range` + 析构回收节点（plan §2）。
-2. 目标：`test_skiplist`、`test_kv` 转绿。
+### Day3（2026-10-14 主体完成 ✅）
+- **接口对齐**（Claude）：`kv_store.hpp` 补 `is_open()`/`empty()`、get/range/size 改 const、删 `kExpectedEntries`；`Wal() = default` + `mode_` 类内默认；规范头 `my_design/final/kv/*.hpp` 同步。
+- **两锁模型定案并实现**：`mutex_`（批锁：wal_.append + writequeue + leader 选举）+ `rwmutex_`（内存锁：读 shared / 写 unique）。写路径两段：
+  - `[段1|mutex_]` append（编码+立即 fwrite）→ 入 writequeue → 查 worked；leader：drain 整批 → 离锁 `wal_.flush()`（Wal `file_mu_` 串行）→ `[段3]` 锁内反复 drain 到空 + 条件二次 flush → notify → `worked=false`；follower：cv 唤醒后自插自己的记录（rwmutex_ unique）。
+  - **修复① 读写在两把锁上裸奔**：get(shared rwmutex_) vs insert(mutex_) 不互斥 → 4 处 skiplist_ 写全部包 rwmutex_ unique；锁序单向 `mutex_→rwmutex_`、读者永不反向 → 无 AB-BA。
+  - **修复② 尾部孤儿死锁（实测复现过）**：leader 的 flush 窗口内进场者无人晋升→永久睡（`test_concurrency` 25s 超时挂死）。解法「**队列不空不放手**」：`worked=false` 与「锁内 drain 到空」同一临界区；等待者 reg 恒留队列 ⇒ 队列空⟺无等待者；push 者要么被当前 leader 认领、要么在 worked=false 后自查晋升 —— 无第三类，尾部无线程进入也不挂。
+  - open：wal_.open + recover() 全量重放叠 skiplist_；close：wal_.close() + opened_=false。
+- **验证**：`test_concurrency`（4 线程×5000 put/get/del）Windows ×3 连跑全绿；`test_skiplist/test_kv/test_recovery` 无回归。
+
+### 下一步（Day3 收尾）
+1. **WSL2 TSAN 收口 ✅**（2026-10-14 通过：`test_concurrency Passed 42.17s`，TSAN 零数据竞争报告、无挂死）。MinGW g++8.1 无 libtsan；规范轮次在 WSL2 跑（源码 `_WIN32` 分叉已含 POSIX fsync 分支，Linux 可直接编译）：
+   ```bash
+   # ⚠️ 踩坑 2026-10-14：勿在源码根目录 `cmake .`（in-source 会污染工作区，
+   #   `.gitignore` 已挡根目录残留）。必须先 build 再 ctest——configure 只写了 Makefile。
+   # ⚠️ 拷到 WSL 原生 ext4 再跑，别在 /mnt 的 9p 上做（慢且偶发怪问题）。
+   cp -r /mnt/f/C++项目/kv-engine ~/kv-engine-tsan && cd ~/kv-engine-tsan
+   cmake -S . -B build -DKV_ENABLE_TSAN=ON -DCMAKE_BUILD_TYPE=Debug
+   cmake --build build -j$(nproc)
+   ctest --test-dir build -R test_concurrency --output-on-failure
+   ```
+   已跑通命令本身。注意 `~/kv-engine-tsan` 是副本，若 `/mnt/f` 再有改动需重新拷/同步。
+2. **put/del 返回值语义**：当前是整批 flush 成功与否（`reg->success`），接口契约「true=新增 / 确有移除」未兑现（方向：WriteRequest 携带 op/key，apply 时记录 insert/erase 真值）。
+3. **close 并发接线**：当前仅 `wal_.close()`；并发下有等待者时应排空/唤醒（现测试在 join 后调 close，无并发 close，暂安全）。
+4. **清理**：`test_concurrency` 关尾部 `remove("concurrency_test.wal")`（WAL 已入 `.gitignore`，可不改）；`kv_store.hpp` 头注从「单锁」更新为「批锁+内存锁」两锁模型。
 
 ### 待实现里程碑
 - Day2：WAL `src/wal.cpp`（append/CRC/replay/clean-close 截断）+ `test_recovery` 转绿。
-- Day3：KvStore `src/kv_store.cpp`（shared_mutex 并发）+ `test_concurrency` 转绿（配 TSAN）。
+- Day3：KvStore `src/kv_store.cpp`（两锁并发）+ `test_concurrency` 转绿（✅ Windows ×3；WSL2 TSAN 收尾即完成）。
 - Day4：bench + README 面试点整理 +（可选）Bloom 前置过滤。
 
 学习契约：核心算法（跳表、WAL、并发）由用户手写实现；Claude 只给接口、测试方向、踩坑提醒、Review。
@@ -122,12 +146,13 @@ del(k):    日志追加 [op=DEL][len][k]                 →  fsync 策略 → �
 - Redis AOF：记录**写命令本身**，恢复时重放命令；AOF rewrite(压缩)、appendfsync(always/everysec/no) 三态即上文。
 - 本引擎取的是「AOF 命令重放」的简化为「record 重放」：key 若为二进制，用长度前缀而非命令文本，天然无解析歧义。
 
-## 4. 并发层 — 读写锁 / 细粒度
+## 4. 并发层 — 读写锁 / 批次 group commit
 
-### 第一版：整表 `std::shared_mutex`
-- `get` / `range`：`shared_lock`（读共享）。
-- `put` / `del` / `flush(截断)`：`unique_lock`（写独占）。
-- 白送正确 + 易理解。面试引导句：`shared_lock` 即「读写锁」，读者之间不互斥、写者独占。
+**【已定案 2026-10-13】：两段锁 + 批次水位线 group commit**（而非下述简单整表锁；作为 Day3 主线）。要点：
+- 写路径三段：`[段1|批锁内] wal.append + 入批登记水位线` → `[离锁] leader 对整批 fsync` → `[段2|rwmutex_ unique] 整批 apply 进跳表` → cv 唤醒本批等待者。读者(shared_lock)永不见未落盘值。
+- `Wal::file_` 非线程安全：append 的 fwrite 与 flush 的 fsync 必须串行同一把批锁；批锁与内存锁(rwmutex_)不嵌套 → 无 AB-BA 死锁。
+- 批边界 = 条数上限 或 超时（按 SyncMode 编排）；延迟上界 = 一批超时。
+- 简单整表 shared_mutex 仍可作为上手第一版实现，功能等价（组提交只是把 fsync 摊到整批）。
 
 ### 进阶（P1，三/四天内可选）
 - **细粒度分段**：把跳表底层链按区间分 *M* 段，每段一把锁；范围 / 跨段写要小心锁顺序防死锁（先锁 header 层方向一致）。

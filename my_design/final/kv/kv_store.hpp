@@ -25,8 +25,9 @@ public:
     KvStore& operator=(const KvStore&) = delete;
 
     // 打开 + 全量重放恢复；失败返 false（别在构造里恢复，报错无门）。
-    bool open(Wal::SyncMode mode, const std::string& path);
-    void close();
+    // 签名顺序已与实现侧对齐：(walPath, mode)。
+    bool open(const std::string& path, Wal::SyncMode mode);
+    void close();                      // 场景二：flush + 写 EOF 收尾标记；日志保留不截断
     bool is_open() const noexcept;
 
     // ---- 对外 API ----
@@ -37,6 +38,7 @@ public:
                  std::vector<std::pair<std::string,std::string>>& out) const;
     bool   empty() const noexcept;
     size_t size() const noexcept;
+    void   flush();                    // 手动 fsync（SyncMode::No 用）
 
 private:
     // put 契约（two-phase group commit）：
@@ -55,6 +57,7 @@ private:
     SkipList<std::string,std::string> skiplist_;
     Wal wal_;
     mutable std::shared_mutex rwmutex_;   // 保护内存索引（读写）
+    Wal::SyncMode mode_ = Wal::SyncMode::EverySec;  // open 记下；驱动批边界/超时策略
     bool opened_ = false;
     // TODO(实现)：group-commit 批队列(mutex+cv)、水位线、等待者注册/唤醒。
 };

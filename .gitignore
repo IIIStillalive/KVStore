@@ -1,7 +1,15 @@
 # build / 中间产物
 build/
+build-*/
 out/
 my_design/include/
+# CMake in-source 误配置时的根目录残留（应改用外部 build 目录）
+CMakeCache.txt
+CMakeFiles/
+CTestTestfile.cmake
+cmake_install.cmake
+Testing/
+Makefile
 # MSVC / VS 工程
 .vs/
 

@@ -160,7 +160,7 @@ bool SkipList<K, V, Cmp>::insert(const K& key, const V& value) {
     //插入
     int newlevel = randomLevel();  //返回当下新节点的高度
     Node* newnode = new Node{key, value, newlevel, std::vector<Node*>(newlevel, nullptr)};
-    int min = currentlevel > newlevel ? newlevel : currentlevel;
+    int min = currentlevel > newlevel ? newlevel : currentlevel;  //要取两者之间小值
     if(newlevel > currentlevel){  //修改当前跳表的实际最高层
         for(int i = currentlevel; i < newlevel; ++i){
             head_->next[i] = newnode;
