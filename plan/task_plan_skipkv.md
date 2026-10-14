@@ -1,6 +1,6 @@
 # SkipList 内存 KV 存储引擎 — 实现方案（独立仓库 kv-engine）
 
-状态：`[Day1 ✅ 跳表全绿 · Day2 ✅ WAL 全绿 · Day3 ✅ 完成（Windows ×3 + WSL2 TSAN 零竞争报告）→ Day4：bench + README]`
+状态：`[Day1 ✅ 跳表全绿 · Day2 ✅ WAL 全绿 · Day3 ✅ 完成（Windows ×3 + WSL2 TSAN 零竞争报告）· Day4 ✅ bench 三表 + README 回填（待校对）]`
 目标：3–5 天。用户手写核心代码、边写边学；Claude 负责 分层设计 / Review / 排障。
 存放：**独立 Git 仓库**已在本机 F:\C++项目\kv-engine 建好（本文件已在该仓库 `plan/`）。
 
@@ -25,6 +25,13 @@
   - open：wal_.open + recover() 全量重放叠 skiplist_；close：wal_.close() + opened_=false。
 - **验证**：`test_concurrency`（4 线程×5000 put/get/del）Windows ×3 连跑全绿；`test_skiplist/test_kv/test_recovery` 无回归。
 
+### Day4（2026-10-14 开工）
+- **bench 起草 ✅**：`bench/bench.cpp` 三组测量——① 跳表 insert/find/erase 多档 N（1e3→1e7）标度验证（判据：10 倍 N 时 ns/op 涨 2~3 倍=O(logN），涨 ~10 倍=退化链表 bug）；② range 跨度 k 递增扫 O(logN+k)；③ KvStore 1 vs 4 线程 put 吞吐（group commit 摊 fsync）。
+- **README 重写 ✅**：状态从「Day1 手写中」更新为交付版——三层层设计（跳表/WAL/并发）+ 两锁并发详述 + 构建/TSAN/bench 命令 + 面试穿透点 4 组 + 边界明确。
+- **跑数回填 ✅**（2026-10-14 WSL2 真机）：① insert 1e3→1e7 仅 149.5→209.2ns = O(logN) 无退化；erase 持平 ~62ns；find 次线性（~2.4×/档，缓存主导）、hotfind 持平 ~9→20ns 反证；② range 单调收敛线性（大跨度 ~9.7×/10 倍 s）；③ put 4 线程 1469 ops/s ≈ 1.8× 单线程（group commit）。三表已贴 README。
+  - 踩坑记录：range 段曾受**编译器 hoisting**（小跨度 ns 值不真实）与**采样不足方差**双重折磨——lo 随轮次伪随机变化 + 固定 20 万采样（大跨度 ≥2000）后才稳定；id=「测量伪影 ≠ 算法」判据在 README 有注。
+- 剩余：校对（P1）；可选 Bloom 前置过滤（P2）。
+
 ### 下一步（Day3 收尾）
 1. **WSL2 TSAN 收口 ✅**（2026-10-14 通过：`test_concurrency Passed 42.17s`，TSAN 零数据竞争报告、无挂死）。MinGW g++8.1 无 libtsan；规范轮次在 WSL2 跑（源码 `_WIN32` 分叉已含 POSIX fsync 分支，Linux 可直接编译）：
    ```bash
@@ -39,12 +46,12 @@
    已跑通命令本身。注意 `~/kv-engine-tsan` 是副本，若 `/mnt/f` 再有改动需重新拷/同步。
 2. **put/del 返回值语义**：当前是整批 flush 成功与否（`reg->success`），接口契约「true=新增 / 确有移除」未兑现（方向：WriteRequest 携带 op/key，apply 时记录 insert/erase 真值）。
 3. **close 并发接线**：当前仅 `wal_.close()`；并发下有等待者时应排空/唤醒（现测试在 join 后调 close，无并发 close，暂安全）。
-4. **清理**：`test_concurrency` 关尾部 `remove("concurrency_test.wal")`（WAL 已入 `.gitignore`，可不改）；`kv_store.hpp` 头注从「单锁」更新为「批锁+内存锁」两锁模型。
+4. **清理**：`test_concurrency` 关尾部 `remove("concurrency_test.wal")`（WAL 已入 `.gitignore`，可不改）。
 
 ### 待实现里程碑
 - Day2：WAL `src/wal.cpp`（append/CRC/replay/clean-close 截断）+ `test_recovery` 转绿。
 - Day3：KvStore `src/kv_store.cpp`（两锁并发）+ `test_concurrency` 转绿（✅ Windows ×3；WSL2 TSAN 收尾即完成）。
-- Day4：bench + README 面试点整理 +（可选）Bloom 前置过滤。
+- Day4：bench + README 面试点整理 +（可选）Bloom 前置过滤。（✅ bench 三表跑出 + README 回填；Bloom 列为 P2 未做）
 
 学习契约：核心算法（跳表、WAL、并发）由用户手写实现；Claude 只给接口、测试方向、踩坑提醒、Review。
 
