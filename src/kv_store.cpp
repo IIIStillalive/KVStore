@@ -1,5 +1,5 @@
-// KvStore 实现 —— 用户手写。接口见 include/kv/kv_store.hpp；设计定案见 my_design/final/kv/kv_store.hpp。
-// 并发定案（用户 · 2026-10-13）：两段锁 + 批次水位线 group commit。
+// KvStore 实现 —— 接口见 include/kv/kv_store.hpp；设计定案见 my_design/final/kv/kv_store.hpp。
+// 并发模型：批锁 mutex_ 护 WAL append + 组提交队列；内存锁 rwmutex_ 护跳表（读 shared / 写 unique）。
 #include "kv/kv_store.hpp"
 #include <mutex>
 namespace kv {
@@ -27,13 +27,13 @@ bool KvStore::open(const std::string& walPath, Wal::SyncMode mode) {
         if (r.op == Wal::OP::Put) skiplist_.insert(r.key, r.val);
         else                      skiplist_.erase(r.key);   // recover 只产 Put/Del（其它 op 已当坏尾裁）
     }
-    // TODO(用户)：后续批机制上线时在此按 mode_ 配置组提交批参数（上限/超时）。
+    // mode_ 记下（衡量组提交批边界/超时策略的输入，当前未参与收批决策）。
     return opened_;
 }
 
 void KvStore::close() {
-    // TODO(用户): 非 open 直接 return；否则排空批 → wal_.close()
-    //   （日志保留不截断！场景二）。重复 close 幂等。
+    // 幂等：非 open 直接 return；否则 wal_.close()
+    //   （一键 flush + EOF 收尾标记，日志保留不截断！场景二）。重复 close 幂等。
     if(!opened_) return;  //幂等保护
     wal_.close();
     opened_ = false;  //置标志位false，防止文件无法open
@@ -44,8 +44,8 @@ bool KvStore::is_open() const noexcept {
 }
 
 bool KvStore::put(const std::string& key, const std::string& val) {
-    // TODO(用户) 剩余项 @handoff：尾部分布者无人晋升的死锁、WriteRequest.data_ 已无用、open 未 recover。
-    // 当前结构（a′ 只批 fsync）：
+    // 写路径（a′ 只批 fsync）：
+    //   当前结构：
     //   [段1｜mutex_]  wal_.append（编码+fwrite 页缓存）→ 请求入 writequeue
     //   leader：drain 整批 → 离锁 wal_.flush()（fsync，Wal 内部 file_mu_ 串行）→ 回锁 notify。
     //   follower：等自己的 reg->is_done 睡眠，唤醒后**自插自己的记录**。
@@ -126,8 +126,7 @@ bool KvStore::put(const std::string& key, const std::string& val) {
 }
 
 std::optional<std::string> KvStore::get(const std::string& key) const {
-    // TODO(用户): std::shared_lock rw(rwmutex_)；返回 skiplist_.find(key) 拷贝。
-    //   ⚠️ 绝不把内部引用带出锁区。
+    // 读 shared；返回 skiplist_.find(key) 拷贝（绝不把内部引用带出锁区）。
     {
         std::shared_lock<std::shared_mutex> lock(rwmutex_);
         return skiplist_.find(key);
@@ -136,7 +135,7 @@ std::optional<std::string> KvStore::get(const std::string& key) const {
 }
 
 bool KvStore::del(const std::string& key) {
-    // TODO(用户) 同 put 两段：append(Del,key,"") → 离锁 flush → rwmutex_ 内 erase；
+    // 同 put 两段：append(Del,key,"") → 离锁 flush → rwmutex_ 内 erase；
     //   返回本批 apply 时 erase 的「确有移除」bool。
     std::string output_buf;
     Wal::OP op(Wal::OP::Del);
@@ -203,7 +202,7 @@ bool KvStore::del(const std::string& key) {
 
 size_t KvStore::range(const std::string& lo, const std::string& hi,
                       std::vector<std::pair<std::string, std::string>>& out) const {
-    // TODO(用户): shared_lock；skiplist_.range(lo, hi, out)。
+    // shared_lock；skiplist_.range(lo, hi, out)。
     {
         std::shared_lock<std::shared_mutex> lock(rwmutex_);
         return skiplist_.range(lo, hi, out);
@@ -211,7 +210,7 @@ size_t KvStore::range(const std::string& lo, const std::string& hi,
 }
 
 bool KvStore::empty() const noexcept {
-    // TODO(用户): shared_lock；返回 skiplist_.empty()。
+    // shared_lock；返回 skiplist_.empty()。
     {
         std::shared_lock<std::shared_mutex> lock(rwmutex_);
         return skiplist_.empty();
@@ -220,7 +219,7 @@ bool KvStore::empty() const noexcept {
 }
 
 size_t KvStore::size() const noexcept {
-    // TODO(用户): shared_lock；返回 skiplist_.size()。
+    // shared_lock；返回 skiplist_.size()。
     {
         std::shared_lock<std::shared_mutex> lock(rwmutex_);
         return skiplist_.size();
@@ -228,7 +227,13 @@ size_t KvStore::size() const noexcept {
 }
 
 void KvStore::flush() {
-    // TODO(用户): 批 LOCK 内 wal_.flush()（与 put 的 leader flush 同锁，保持 file_ 串行）。
+    // 手动 fsync（SyncMode::No 用）：持批锁调 wal_.flush() ——
+    //   与 put/del 的 leader 刷盘同一把锁、同一条 Wal 串行通道（file_mu_ 在 Wal 内部），
+    //   批锁保证「本调用之前已 append 的全部写请求」此刻整份落盘；
+    //   之后进场的新请求由各自的 leader 周期/批次刷盘覆盖，互不干扰。
+    // 未 open 时 wal_ 无句柄，flush_locked() 内部安全返回 false，无需在此额外守卫。
+    std::unique_lock<std::mutex> lock(mutex_);
+    wal_.flush();
 }
 
 }  // namespace kv

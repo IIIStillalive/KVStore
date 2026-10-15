@@ -1,6 +1,6 @@
 # SkipList 内存 KV 存储引擎 — 实现方案（独立仓库 kv-engine）
 
-状态：`[Day1 ✅ 跳表全绿 · Day2 ✅ WAL 全绿 · Day3 ✅ 完成（Windows ×3 + WSL2 TSAN 零竞争报告）· Day4 ✅ bench 三表 + README 回填（待校对）]`
+状态：`[Day1 ✅ 跳表全绿 · Day2 ✅ WAL 全绿 · Day3 ✅ 完成（Windows ×3 + WSL2 TSAN 零竞争报告）· Day4 ✅ bench 三表 + README 回填 · 秋招打磨 ✅ README 去教学化 + 注释清理 + flush() 落地]`
 目标：3–5 天。用户手写核心代码、边写边学；Claude 负责 分层设计 / Review / 排障。
 存放：**独立 Git 仓库**已在本机 F:\C++项目\kv-engine 建好（本文件已在该仓库 `plan/`）。
 
@@ -31,6 +31,12 @@
 - **跑数回填 ✅**（2026-10-14 WSL2 真机）：① insert 1e3→1e7 仅 149.5→209.2ns = O(logN) 无退化；erase 持平 ~62ns；find 次线性（~2.4×/档，缓存主导）、hotfind 持平 ~9→20ns 反证；② range 单调收敛线性（大跨度 ~9.7×/10 倍 s）；③ put 4 线程 1469 ops/s ≈ 1.8× 单线程（group commit）。三表已贴 README。
   - 踩坑记录：range 段曾受**编译器 hoisting**（小跨度 ns 值不真实）与**采样不足方差**双重折磨——lo 随轮次伪随机变化 + 固定 20 万采样（大跨度 ≥2000）后才稳定；id=「测量伪影 ≠ 算法」判据在 README 有注。
 - 剩余：校对（P1）；可选 Bloom 前置过滤（P2）。
+
+### 秋招打磨（2026-10-15，岗位方向：分布式存储）
+- **README 重写 ✅**：去掉教学/面试措辞，改分布式存储内核定位（write-ahead ordering / fsync 策略 / group commit / 坏尾 torn-write）；三张 bench 表保留为实证亮点；Roadmap 列 分段日志/共识复制/网络层/布隆索引 四个演进方向。
+- **P0#1 过时注释清理 ✅**：`include/ + src/` 全部 `TODO(用户)`/"stub"/"教学"标记清除——跳表 6 个"待实现"标头改为真实描述（算法主体未动）；`kv_store.cpp` 里「死锁未解决/WriteRequest.data_ 未删/open 未 recover」这条@handoff 已与现状矛盾（均已完成），删除。
+- **P0#2 `KvStore::flush()` ✅**：stub 落地——批锁 `mutex_` 内 `wal_.flush()`，与 put/del leader 刷盘同锁序。scratch 验证：SyncMode::No 下 put→flush→不 close 崩溃→重放两键俱在；4 测试全绿。
+  - ⚠️ 现状说明：put 的 leader 近期仍每批必刷盘（与 mode_ 无关），故 flush() 此刻与 leader 刷盘冗余，为 README 声明的 `No 交 OS + 手动 flush()` 接口占位，语义待 EverySec/No gate leader 时才能完全体现。
 
 ### 下一步（Day3 收尾）
 1. **WSL2 TSAN 收口 ✅**（2026-10-14 通过：`test_concurrency Passed 42.17s`，TSAN 零数据竞争报告、无挂死）。MinGW g++8.1 无 libtsan；规范轮次在 WSL2 跑（源码 `_WIN32` 分叉已含 POSIX fsync 分支，Linux 可直接编译）：

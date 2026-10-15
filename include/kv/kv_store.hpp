@@ -1,7 +1,7 @@
 #pragma once
 
 // ============================================================================
-// KvStore — 门面：跳表索引 + WAL + 并发。实现由用户手写（plan §4/§5）。
+// KvStore — 门面：跳表索引 + WAL + 并发。设计见 plan §4/§5。
 //
 // 并发设计（已定案 · 两锁 group commit）：【批锁 mutex_ + 内存锁 rwmutex_】
 //   mutex_   批锁：wal_.append（编码+fwrite 页缓存）+ writequeue + leader 选举
@@ -59,7 +59,8 @@ public:
 
 private:
     // put/del 契约（two-phase group commit）见头注。
-    // TODO(用户)：group-commit 批队列(独立 mutex+cv 护 file_)、水位线、等待者注册/唤醒。
+    // 一次写请求的等待条目：reg 入 writequeue 并与调用线程绑定，
+    // leader 刷盘后逐条置 is_done + notify，调用线程据此从 cv 唤醒。
     struct WriteRequest{
         std::condition_variable cv_;  //信号量
         bool success = {false};

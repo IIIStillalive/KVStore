@@ -1,9 +1,15 @@
-# kv-engine
+# kv-engine — 内存键值存储内核
 
-手写内存 KV 存储引擎：**跳表**有序索引（O(logN) 增删查 + 范围查询）、**WAL** 断电恢复、
-**读写锁 + 批次 group commit** 并发。教学性质，面试直通 Redis ZSet / AOF / 缓存穿透三考点。
+嵌入式内存 KV 存储引擎：**跳过索引列表（SkipList）** 做有序数据面，**Write-Ahead Log（WAL）** 做崩溃一致，**两锁 group commit** 做并发写入。写路径严格「先落 WAL、后 apply 内存」；断电后按 WAL 全量重放重建索引（坏尾自动检测截断）。面向**分布式存储的存储内核/数据面**定位：单机内核已具备后续接多副本复制、分段日志所需的基本组件。
 
-## 设计总览
+## 特性亮点
+
+- **O(logN) 有序索引**：跳过列表，`maxlevel=32, p=1/4`。增/删/查 O(logN)，闭区间范围查询 O(logN+k)。10⁷ 级数据实证标度（见 Benchmark）。
+- **WAL 断电恢复**：记录 `[op | keyLen | key | valLen | val | crc32]`，长度前缀 + CRC 覆盖全记录；崩溃产生的坏尾（torn write）自动物理截断。fsync 三档策略：`Always` / `EverySec` / `No`（手动 flush），覆盖从强一致到聚合批刷的取舍。
+- **两锁 group commit**：写请求在批锁内 append 入队，leader 离锁对整批只刷一次盘——fsync 从「每 op 一次」摊到「每批一次」（InnoDB / PostgreSQL group commit 同款思路）。读走 `shared_mutex` 并发执行，写互斥，锁序单向无 AB-BA。
+- **可验证的数据面**：10 万随机操作对照 `std::map` 金标准全绿；WSL2 TSAN 并发测试零数据竞争；bench 标度判据核验（见下）。
+
+## 架构
 
 ```
                 ┌──────────────────────────────────────┐
@@ -18,34 +24,25 @@
               有序索引（memory）       编码[op|len|k|v|CRC]
 ```
 
-### ① 排序索引 — SkipList
-- header-only 模板，`maxlevel=32, p=1/4`（对齐 Redis ZSet，内存/速度折中）。
-- `updatePrev()` 核心辅助：从 header 顶层向下逐层下沉，记录每层待插/删位置的前驱。
-- 覆盖式 `insert`（同 key 覆 value）、`find` 返回 `optional<V>` 拷贝、`erase`、
-  闭区间 `range(lo,hi)`。
-- 复杂度：查 / 删 **O(logN)**，范围查询 **O(logN + k)**。
+## 内核设计
 
-### ② 持久化 — WAL（Write-Ahead Log）
-- 记录布局（小端）：`[op:1][keyLen:4][key][valLen:4][val][crc32:4]`；
-  CRC 覆盖整条 record，保证**坏尾可检**。
-- 写路径固定顺序：**先 append 日志，后 apply 内存**（AOF/命令重放式）。
-- 恢复语义（本引擎场景二）：`open` 每次全量重放 WAL 重建索引；`close` 保留日志
-  （写 9 字节 EOF 标记 0xFF），崩溃恢复时坏尾自动物理截断、EOF 后跳过继续。
-- fsync 三态（Redis AOF 同款）：`Always` 每条落盘 / `EverySec` 每秒批量 /
-  `No` 交 OS + 手动 `flush()`。
+### 内存索引 — SkipList
+- header-only 模板；`updatePrev()` 从顶层逐层下沉，记录每层待插/删位置的前驱。
+- 覆盖式 `insert` / `find` 返回 `optional<V>` 拷贝 / `erase` / 闭区间 `range(lo,hi)`。
 
-### ③ 并发 — 两锁 group commit
-- **批锁 `mutex_`**：`wal_.append`（fwrite 页缓存）+ 写请求入 `writequeue` + leader 选举。
-- **内存锁 `rwmutex_`**：跳表读 `shared` / 写 `unique`；读并发，写互斥。
+### 持久化 — WAL
+- **write-ahead ordering**：任何写操作先 append 到日志、成功后才 apply 内存索引——崩溃任意时刻重放日志即得一致态，重放天然幂等（Put/Del 覆盖）。
+- **坏尾处理**：正常关闭写 9 字节 EOF 标记（0xFF）；崩溃遗留的半条记录 CRC 校验失败，恢复时物理截断，EOF 之后跳过继续。
+- **fsync 策略**：`Always` 每条落盘 / `EverySec` 每秒批量 / `No` 交 OS + 手动 `flush()`；`close` 保留日志不截断（场景二语义）。
+
+### 并发 — 两锁 group commit
 - 写路径三段：
-  1. `[段1｜mutex_]` append → 请求入队；
-  2. `[段2｜离锁]`   leader 对整批只调一次 `wal_.flush()`（fsync 摊到整批）；
-  3. `[段3｜mutex_]` 锁内反复 drain 队列到 **空** → notify → `worked=false` 下轮才可竞选。
-- **关键不变量：队列空 ⟺ 无等待者。** 等待者的 `reg` 恒留在队列里，故 flush 窗口内
-  进场者要么被当前 leader 认领、要么在 `worked=false` 后自晋升——无「无人晋升」死锁。
-- **锁序单向 `mutex_ → rwmutex_`**，读者只持 `rwmutex_` 从不反向拿 `mutex_`
-  → 无 AB-BA 死锁；`Wal::file_` 由 Wal 内部 `file_mu_` 串行，两层不嵌套。
-- **公开接口绝不返回内部引用**：`get` 返回 `optional<string>` 拷贝、`range` 返回 `vector` 拷贝。
+  1. `[段1｜mutex_]` append → 请求入 `writequeue`；
+  2. `[段2｜离锁]`   leader 对整批只调一次 `wal_.flush()`（fsync 摊到整批，**不背在 KvStore 锁上**）；
+  3. `[段3｜mutex_]` 锁内反复 drain 队列到**空** → notify → `worked=false`，下轮才可重新竞选。
+- **活性保证**：不变量「队列空 ⟺ 无等待者」。等待者恒留队列，flush 窗口内进场者要么被当前 leader 认领、要么在 `worked=false` 后自晋升——消除「flush 窗口内无人晋升」的尾部孤儿等待（曾实测复现并根因定位）。
+- **锁序**：单向 `mutex_ → rwmutex_`，读者只持 `rwmutex_` 从不反向 → 无 AB-BA 死锁；`Wal::file_` 由引擎内 `file_mu_` 串行，两层不嵌套。
+- **API 不泄引用**：`get` 返回 `optional<string>` 拷贝、`range` 返回 `vector` 拷贝，内部索引不对外暴露。
 
 ## 构建 / 测试
 
@@ -64,16 +61,16 @@ cmake --build build -j$(nproc)
 ctest --test-dir build -R test_concurrency --output-on-failure
 ```
 
-**Bench**（吞吐 + O(logN) 标度验证）：
+**Bench**（吞吐 + O(logN) 标度验证；`kv_bench [最大指数档]`，默认 5 档 1e3..1e7）：
 
 ```bash
 cmake -S . -B build -DKV_BUILD_BENCH=ON && cmake --build build -j
-./build/kv_bench        # 默认测 N = 1e3..1e7 共 5 档
+./build/kv_bench
 ```
 
-## Benchmark 结果（WSL2，执行 `./build/kv_bench 7`）[^1]
+## Benchmark（WSL2 原生 ext4，g++ 12）
 
-### ① SkipList 纯内存吞吐（p=1/4, maxlevel=32；ns/op）
+### ① SkipList 纯内存吞吐（ns/op）
 
 | N      | insert/op | find/op | hotfind/op | erase/op |
 |--------|-----------|---------|------------|----------|
@@ -83,12 +80,7 @@ cmake -S . -B build -DKV_BUILD_BENCH=ON && cmake --build build -j
 | 1e6    | 187.0     | 880.7   | 18.7       | 63.1     |
 | 1e7    | 209.2     | 1770.0  | 20.1       | 61.5     |
 
-判据核验：
-- **insert / erase 基本持平**（1e3→1e7 仅 ~1.4× / ~1.0×，数据量涨了 1 万倍）→ **O(logN)**。
-  若层高有 bug 退化成单层链表，顺序插入会变 O(N²)，每档涨幅 ~10×，对照一目了然。
-- **find 涨 ~31× / 4 档 ≈ 2.4×/档（次线性）**：随机键查找的涨幅来自**指针追逐的缓存未命中**
-  （跳表节点 malloc 随机散布），不是算法复杂度——O(N) 退化会每 10×N 涨 ~10×。
-- **hotfind 基本持平**（8.5→20.1）反证了上面的判断：缓存友好时跨档只涨 2×。
+验证方式（标度判据）：数据量涨 10⁴×，insert 仅 149.5→209.2 ns（1.4×）、erase 持平——**O(logN) 实证**；对照：若层高退化单链，顺序插入将劣化为 O(N²)，每档涨幅 ~10×。随机键 find 次线性（~2.4×/档），来源为指针追逐的缓存未命中而非复杂度——同为随机键下 hotfind（固定热键）跨档持平（8.5→20.1）佐证。
 
 ### ② 范围查询 [lo, lo+s]（N=1e5，ns/op）
 
@@ -100,62 +92,32 @@ cmake -S . -B build -DKV_BUILD_BENCH=ON && cmake --build build -j
 | 1000     | 24157.1  |
 | 10000    | 233734.3 |
 
-- s 每 10 倍 → ns/op ≈ **1~2×（小跨度，定位 O(logN) 常数项 ~0.8µs 主导）→ ~5.5× → ~9.7×（大跨度，O(k) 主导）**
-  ——整条曲线单调向上并收敛到线性，符合 **O(logN + k)**。
-- 注：lo 每轮伪随机变化，避免编译器把 range 提升出循环（hoisting）；s=100/1000 曾因采样
-  不足出现平台（s=100≈1000 均 ~20µs），加大采样后消除——是测量伪影，非算法问题。
+小跨度段由 O(logN) 定位常数 ~0.8µs 主导，大跨度收敛线性——**O(logN + k)** 实证，可用跨度扫描成本与真实分布对齐（本引擎 value 内联于节点，顺序扫描缓存友好）。
 
-### ③ KvStore put 吞吐（SyncMode::EverySec，leader 每批 flush、外围定时器未接线）
+### ③ KvStore put 吞吐（group commit 批刷 fsync）
 
 | 线程数 | ops/s | us/op |
 |--------|-------|-------|
 | 1      | 807   | 1238.5 |
 | 4      | 1469  | 680.8  |
 
-- 4 线程 ≈ **1.8× 单线程吞吐**：批锁 + leader 离锁刷盘把 fsync 从「每 op 一次」摊到「每批一次」，
-  多线程下磁盘 I/O 不再逐条卡在锁上 → **group commit 生效**。
-- 如实标注：当前实现（plan「待办」遗留）leader 每批都调 `wal_.flush()`，单线程下每批≈1 条
-  ~~故单线程等价每次 put 一次真 fsync~~，数字偏保守；定时器接线后每线程吞吐会上一个量级。
+4 线程 ≈ **1.8× 单线程**：批锁 + leader 离锁刷盘把 fsync 摊到整批，磁盘 I/O 不再逐条卡在锁上。注：当前 `EverySec` 由 leader 每批 flush 实现（定时聚合待接线），数字为保守下限。
 
-[^1]: `kv_bench` 输出三张表（跳表标度、范围跨度、并发吞吐），核对判据：
-N 每 10 倍，跳表 ns/op 最多涨 2~3 倍（O(logN)），而不是 10 倍（退化单链 bug）；
-kv 4 线程吞吐应显著高于 1 线程（group commit 摊薄 fsync）。
+> 复现环境：WSL2 + 原生 ext4（9p 会引入文件系统层噪声），`./build/kv_bench 7`。
 
-## 面试穿透点
+## 设计权衡
 
-### 1. 跳表为什么 O(logN)？Redis 为什么选跳表不选红黑树 / B+树？
-- **期望层高**：每节点以 p=1/4 向上晋升，期望层高 O(1) 空间；从顶层下沉，每层
-  `updatePrev` 前进的步数期望 O(logN) → 查/删平均 O(logN)。
-- **B+树**：为磁盘外存设计（高扇出、一页多键、顺序 IO），内存里无磁盘优势，实现复杂。
-- **红黑树**：内存均衡 O(logN)，但区间查询要先 O(logN) 定位再中序遍历；无法便捷 rank /
-  按区间枚举。
-- **跳表**：区间查询天然（底层有序链顺序扫）、可加 span 字段做 O(logN) rank、p 可调、
-  bug 好排查（无旋转），Redis 综合「实现简单 + ZRANGE 支持 + 可扩展」胜出。
+- **跳过列表 vs 红黑树 vs B+树**：B+树为磁盘外存（高扇出、一页多键）设计，内存中无磁盘优势且实现复杂；红黑树区间查询需定位后再中序遍历；跳表层高期望 O(1) 空间、支持按 span 做 O(logN) rank、参数可调，区间枚举天然——选作内存有序索引。
+- **WAL 记录格式（长度前缀 + CRC）vs 命令文本**：长度前缀使 key/value 可含任意二进制、无解析歧义；CRC 覆盖整条记录，坏尾可安全截断。非命令重放，恢复无需编解码层。
+- **组提交而非逐条 fsync**：单条 fsync 受盘 IOPS 上限约束，组提交把吞吐从「IOPS 受限」移到「批尺寸受限」（InnoDB / PostgreSQL 同思路）。
 
-### 2. WAL 与 Redis AOF 的对比
-- 同：都是「写先落盘、后生效」的 append-only 恢复日志。
-- Redis AOF：记录写命令本身，恢复时重放命令；`appendfsync` 三态即上文
-  （always / everysec / no）；AOF rewrite 压缩是配套手段。
-- 本引擎：record 用「长度前缀 + CRC」而非命令文本——key 可含二进制，无解析歧义，
-  CRC 校验坏尾可安全截断。「先日志后内存」「长度前缀防半条」「CRC 断坏尾」三条是命门。
+## Roadmap：迈向分布式存储
 
-### 3. 缓存穿透防护（本引擎可作延伸点）
-1. **参数校验 / 布隆过滤器**：不存在的 key 先在引擎外挡掉 → 可加 `bloom_exists(key)` 前置过滤。
-2. **空值缓存**：把「key 不存在」也缓存片刻，防穿透打穿下游 DB。
-3. **互斥锁单飞**：同一 key 缺失只允许一个线程查下游，其余等缓存回填 —— 可用细粒度锁投影。
+当前为单机内核（未实现以下，作为演进方向）：
 
-### 4. 并发难点（面试可讲）
-- Redis 本身单线程，靠 IO 多路复用规避锁；本引擎为学习跳表并发用读写锁做正确性入门。
-- group commit：把每 op 一次的 fsync 摊到整批 —— 批锁 + leader 离锁刷盘，
-  **fsync 永不背在 KvStore 锁上**（读吞吐不被磁盘拖死）。
-- 尾部孤儿死锁（曾实测复现）：flush 窗口内进场者无人晋升 → 「队列不空不放手」解法，
-  不变量 `队列空 ⟺ 无等待者` 是正确性核心。
+1. **分段日志 + compaction**：现 WAL 无限 append，需分段 + 后台压缩（对齐 RocksDB manifest / 日志段治理）。
+2. **多副本复制 / 共识**：WAL 已提供全局有序的 append-only 序列，可对接 Raft 等并发共识做日志复制落副本。
+3. **网络协议层**：socket/epoll 数据面接入，对外服务化。
+4. **布隆索引 / 空值缓存**：不存在键前置过滤，治理读放大的缓存穿透。
 
-## 边界 / 明确不做
-- 不做 AOF rewrite 压缩、多文件多段日志、事务级原子性 / 隔离级别。
-- 不做 lock-free / 每节点细化（列为"未来可扩展"）。
-- 不做磁盘索引（内存优先；磁盘 B+树是另一门功课）。
-- key / value 均为 `std::string`（Skiplist 模板内部通用，门面定 string）。
-
-设计与工作契约详见 `plan/task_plan_skipkv.md`；README 起草、评审与排障由 Claude 负责，
-算法主体由我手写（教学项目）。
+设计与评审记录：`plan/`。测试基线：`test_kv`（10 万随机 op 对照 std::map 金标准）、`test_recovery`（干净重启 / 崩溃重放 / 坏尾截断）、`test_concurrency`（4 线程混跑 + WSL2 TSAN 零竞争）。

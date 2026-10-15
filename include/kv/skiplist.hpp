@@ -3,10 +3,7 @@
 // ============================================================================
 // SkipList<K, V, Cmp> — 内存有序索引（header-only 模板，定义必须对本 TU 可见）
 //
-// 学习契约：本文件只有「接口 + 数据结构 + 可编译的 stub」，算法主体由你手写。
-// 结构见 plan/task_plan_skipkv.md §2；每个 TODO(用户) 是你需要填充的核心逻辑。
-//
-// 复杂度目标：
+// 复杂度：
 //   查 / 删     平均 O(logN)，从 header 顶层逐层下沉
 //   范围查询    O(logN + k)，k = 结果数
 // ============================================================================
@@ -78,25 +75,21 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// TODO(用户) 实现区：以下 stub 保证可编译，但逻辑未实现，测试当前为「红」。
-// 你把每个函数体按 plan §2 替换成真实实现即可逐步转绿。
+// 实现区：行为契约见 test_skiplist / test_kv（金标准对照）。
 // ---------------------------------------------------------------------------
 
 template<typename K, typename V, typename Cmp>
 SkipList<K, V, Cmp>::SkipList()
     // 成员已就地初始化：maxlevel=32, currentlevel=1, p_=0.25f, size_=0
     : rng_(std::random_device{}()) {
-    // TODO(用户):
-    //   1) 建哨兵：head_ = new Node{ K{}, V{}, maxlevel, vector<Node*>(maxlevel, nullptr) };
-    //      哨兵 level=maxlevel，next 全空（每层都从它开始下沉）。
+    // 建哨兵：head_ = new Node{ K{}, V{}, maxlevel, vector<Node*>(maxlevel, nullptr) }。
+    // 哨兵 level=maxlevel，next 全空 —— 每层下沉都从它开始。
     head_ = new Node{K{}, V{}, maxlevel, std::vector<Node*> (maxlevel, nullptr)};
 }
 
 template<typename K, typename V, typename Cmp>
 SkipList<K, V, Cmp>::~SkipList() {
-    // TODO(用户): 沿底层链释放所有节点，防止裸指针泄漏
-    //   （配合 erase 一起写；释放顺序见 plan §2）。
-
+    // 沿底层链释放所有节点（底层链覆盖全部节点与哨兵，无重复可达），防止裸指针泄漏。
     auto curr = head_;
     while(curr){
         Node* next = curr->next[0];
@@ -108,9 +101,8 @@ SkipList<K, V, Cmp>::~SkipList() {
 template<typename K, typename V, typename Cmp>
 void SkipList<K, V, Cmp>::updatePrev(const K& key,
                                      std::vector<Node*>& prev) {
-    // TODO(用户): 从 header 顶层下沉到第 0 层，记每层最后「后继 >= key」的节点。
-    //   1) prev 只需覆盖 0..currentLevel_；
-    //   2) 每层向下一层时指针要正确下跳，这是最容易写错的地方。
+    // 从 header 顶层下沉到第 0 层，记每层最后「后继 >= key」的节点。
+    //   prev 只需覆盖 0..currentlevel；每层向下一层前指针停在「后继还小于 key」处。
     auto it = head_;
     int level = currentlevel - 1;
     while(true){
@@ -131,7 +123,7 @@ void SkipList<K, V, Cmp>::updatePrev(const K& key,
 
 template<typename K, typename V, typename Cmp>
 int SkipList<K, V, Cmp>::randomLevel() {
-    // TODO(用户): level=1; 以 p_ 概率 level++（rng_ 驱动），封顶 maxLevel_。返回 level。
+    // level=1 起步，以 p_ 概率 level++（rng_ 驱动），封顶 maxlevel。
 
     //我的想法是使用std::mt19937生成0-1.0之间的概率，当概率小于P_时++，小于时结束
     std::uniform_real_distribution<double> udist(0.0, 1.0);
@@ -145,11 +137,11 @@ int SkipList<K, V, Cmp>::randomLevel() {
 
 template<typename K, typename V, typename Cmp>
 bool SkipList<K, V, Cmp>::insert(const K& key, const V& value) {
-    // TODO(用户):
-    //   1) updatePrev(key, prev) 定位前驱们；
-    //   2) 若 prev[0]->next[0] 的 key == key → 覆盖其 value，返回 false；
-    //   3) 否则 randomLevel() 起飞，从下往上建节点并逐层接入 prev 链，size_++，
-    //      返回 true；若新层超过 currentLevel_ 记得提升。
+    // 覆盖式插入（同 key 覆 value）：
+    //   1) updatePrev(key, prev) 定位各层前驱；
+    //   2) 若 prev[0]->next[0] 的 key == key → 覆盖其 value，返回 false（未新增）；
+    //   3) 否则 randomLevel() 起飞，从下往上建节点并逐层接入 prev 链，size_++；
+    //      新层超过 currentlevel 时提升 currentlevel 并挂到 head_。
     std::vector<Node*> prev(maxlevel, nullptr);
     updatePrev(key, prev);
     if(prev[0]->next[0] && prev[0]->next[0]->key == key){
@@ -180,7 +172,7 @@ bool SkipList<K, V, Cmp>::insert(const K& key, const V& value) {
 
 template<typename K, typename V, typename Cmp>
 std::optional<V> SkipList<K, V, Cmp>::find(const K& key) const {
-    // TODO(用户): 从顶层下沉查 key；命中返回 value 拷贝，未命中返回 nullopt。
+    // 从顶层下沉查 key；命中返回 value 拷贝，未命中返回 nullopt。
     auto it = head_;  //遍历指针
     int level = currentlevel - 1;
     while(true){
@@ -199,8 +191,8 @@ std::optional<V> SkipList<K, V, Cmp>::find(const K& key) const {
 
 template<typename K, typename V, typename Cmp>
 bool SkipList<K, V, Cmp>::erase(const K& key) {
-    // TODO(用户): updatePrev 定位 → 若存在则把各层 next 越过去 → 释放节点，size_--。
-    //   可选：某层已无后继时回落 currentLevel_（不是必须，保持简单即可）。
+    // updatePrev 定位 → 若存在则把各层 next 越过去 → 释放节点，size_--；
+    //   顺带回落 currentlevel（顶层 head_->next[] 已空即该层无节点）。
     std::vector<Node*> prev(maxlevel, nullptr);
     updatePrev(key, prev);
     Node* curr = prev[0]->next[0];
@@ -223,7 +215,8 @@ bool SkipList<K, V, Cmp>::erase(const K& key) {
 template<typename K, typename V, typename Cmp>
 size_t SkipList<K, V, Cmp>::range(const K& lo, const K& hi,
                                   std::vector<std::pair<K, V>>& out) const {
-    // TODO(用户): 底层链 lower_bound(lo) 顺序扫到 >hi；把结果 push 进 out，返回条数。
+    // 底层链 lower_bound(lo) 顺序扫到 >hi：下沉定位到第一个 >= lo 的节点，
+    //   随后沿第 0 层逐节点 scan，结果 push 进 out，返回条数。
 
     //利用查询找到第层的lo，然后一直判断push
     auto it = head_;  //遍历指针
@@ -237,7 +230,7 @@ size_t SkipList<K, V, Cmp>::range(const K& lo, const K& hi,
         --level;
         if(level < 0) break;
     }
-    //当循环退出的时候it->next[0]->key 只能是>= lo 
+    //当循环退出的时候it->next[0]->key 只能是>= lo
     //接下只要判断是否存在以及是否大于hi即可
     while(it->next[0] && it->next[0]->key <= hi){
         out.emplace_back(it->next[0]->key, it->next[0]->value);

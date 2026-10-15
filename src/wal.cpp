@@ -1,5 +1,5 @@
 // ============================================================================
-// 层② WAL 实现 —— 用户手写。接口见 include/kv/wal.hpp；规范见 my_design/final/kv/wal.hpp。
+// 层② WAL 实现 —— 接口见 include/kv/wal.hpp；规范见 my_design/final/kv/wal.hpp。
 // 持久化语义（定案 · 场景二）：close 保留日志；open 每次全量重放。
 // ============================================================================
 #include <array>
@@ -86,7 +86,7 @@ constexpr size_t DATA_OFFSET = 1 + 4;
 }  // namespace
 
 Wal::Wal(std::string path, SyncMode mode) :  mode_(mode), path_(path){
-    // TODO(用户): 句柄默认空（未 open）。
+    // 句柄先置空（file_ 成员默认），随后 open() 真正打开/创建日志。
 
     //初始化就要查看文件是否有赶紧退出标志
     open(path_);
@@ -240,7 +240,7 @@ bool Wal::is_open() const noexcept {
 }
 
 size_t Wal::file_size() const noexcept {
-    // TODO(用户): 当前日志字节数（观测增长用）。
+    // 当前日志字节数（观测增长用）。
     //c++17方法
     //std::uintmax_t size = std::filesystem::file_size(path_);
     //c++stream
