@@ -1,4 +1,4 @@
-// KvStore 实现 —— 接口见 include/kv/kv_store.hpp；设计定案见 my_design/final/kv/kv_store.hpp。
+// KvStore 实现 —— 接口见 include/kv/kv_store.hpp。
 // 并发模型：批锁 mutex_ 护 WAL append + 组提交队列；内存锁 rwmutex_ 护跳表（读 shared / 写 unique）。
 #include "kv/kv_store.hpp"
 #include <mutex>

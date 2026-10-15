@@ -2,7 +2,7 @@
 build/
 build-*/
 out/
-my_design/include/
+my_design/
 # CMake in-source 误配置时的根目录残留（应改用外部 build 目录）
 CMakeCache.txt
 CMakeFiles/
@@ -22,3 +22,6 @@ resume-zh.tex
 
 # 本地状态
 *.wal
+
+# 面试向内容（口述稿），永不提交——GitHub 不展示教学/面试部分
+面试/
