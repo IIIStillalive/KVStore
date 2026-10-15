@@ -10,6 +10,7 @@ CTestTestfile.cmake
 cmake_install.cmake
 Testing/
 Makefile
+resume-zh.tex
 # MSVC / VS 工程
 .vs/
 
