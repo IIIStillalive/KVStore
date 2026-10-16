@@ -39,9 +39,13 @@ public:
     std::vector<LogRecord> recover();            // 重放全部记录交上层；坏尾(长度/Crc)
                                                  // 截断并停止；含 EOF 收尾标记处理
     void close();                                // flush + 写 EOF 收尾标记（不删日志）
-    bool flush();                                // 手动 fsync（EverySec 由外部计时器/队刷调）
+    bool flush();                                // 手动 fsync：fflush+fsync（EverySec 由外部计时器/队刷调）
+    bool flush_to_os();                          // 仅 fflush：C 缓冲 → OS 页缓存，不 fsync；
+                                                 //   EverySec leader 每批返回前调（磁盘 fsync 交定时器）
     bool is_open() const noexcept;
     size_t file_size() const noexcept;           // 观测 log 增长用
+    size_t flush_count() const noexcept;         // 测试/诊断钩子：fsync 成功次数（三态判据）
+    size_t to_os_count() const noexcept;         // 测试/诊断钩子：flush_to_os 成功次数（EverySec 判据）
 
 private:
     bool CRC32(const LogRecord&) const;          // 校验单条整记录
@@ -61,12 +65,14 @@ private:
     // EOF 收尾标记（close 写、recover 跳过）：固定 9 字节 [0xFF][keyLen:4=0][valLen:4=0]，
     // 无 crc——完整性信号，非正确性命门；其后可能是后续会话追加的新记录，须跳过继续。
     SyncMode mode_ = SyncMode::EverySec;  // fsync 时机：Always=append 内即 flush；EverySec/No=外部计时器/队刷调 flush()
+    size_t flush_success_ = 0;             // flush_locked 成功自增（file_mu_ 保护）；fsync 三态判据
+    size_t flush_to_os_count_ = 0;       // flush_to_os 成功自增（file_mu_ 保护）；EverySec 每批到 OS 判据
     std::string path_;           // 日志路径（open 记下；recover 独立按它重放）
     std::FILE* file_ = nullptr;  // 写句柄（fopen "ab" 二进制追加）：append 直写、close 写 EOF 收尾标记
     // file_mu_ 串行化对 file_ 的一切访问（append 的 fwrite、close/flush 的 fflush+fsync+fclose）。
     // 必需：上层 group-commit 的 leader 会在 KvStore 锁外调 flush()，而并发 put 的 append 在
     // 锁内 fwrite——两者对同一 FILE* 必须互斥（C stdio 句柄非线程安全）。
-    std::mutex file_mu_;
+    mutable std::mutex file_mu_;
 };
 
 

@@ -228,10 +228,23 @@ bool Wal::flush() {
     return flush_locked();
 }
 
+bool Wal::flush_to_os() {
+    // 仅 fflush：C 缓冲 → OS 页缓存，不碰磁盘（无 fsync_native）。
+    // EverySec leader 每批返回前调——返回语义 =「已到 OS」；OS→磁盘由 1s 定时器 flush() 覆盖，
+    // 丢窗口只计磁盘段（≤1s），对齐 Redis appendfsync everysec（每命令 write 到页缓存 + 每秒 fsync）。
+    std::lock_guard<std::mutex> g(file_mu_);
+    if (!file_) return false;
+    const bool ok = std::fflush(file_) == 0;
+    if (ok) ++flush_to_os_count_;   // 成功才计入（到 OS 判据）
+    return ok;
+}
+
 bool Wal::flush_locked() {
     // 承调用方已持 file_mu_（append 的 Always、close、flush 共同路径）。
     if (!file_) return false;
-    return std::fflush(file_) == 0 && fsync_native(file_) == 0;
+    const bool ok = std::fflush(file_) == 0 && fsync_native(file_) == 0;
+    if (ok) ++flush_success_;   // 成功才计入（fsync 行为判据，见 flush_count）
+    return ok;
 }
 
 bool Wal::is_open() const noexcept {
@@ -249,6 +262,19 @@ size_t Wal::file_size() const noexcept {
     f.seekg(0, std::ios::end);
     std::streampos size = f.tellg();
     return static_cast<size_t>(static_cast<std::streamoff>(size));
+}
+
+size_t Wal::flush_count() const noexcept {
+    // 测试/诊断钩子：fsync 成功次数（Always/EverySec/No 三态判据）。
+    // 与 flush_locked 同互斥（file_mu_）：读时与 leader/定时器并发自增无竞态（TSAN）。
+    std::lock_guard<std::mutex> g(file_mu_);
+    return flush_success_;
+}
+
+size_t Wal::to_os_count() const noexcept {
+    // 测试/诊断钩子：flush_to_os 成功次数（EverySec「返回已到 OS」判据）。
+    std::lock_guard<std::mutex> g(file_mu_);
+    return flush_to_os_count_;
 }
 
 std::string Wal::encode(OP op, const std::string& key,

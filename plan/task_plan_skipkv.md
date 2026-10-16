@@ -38,6 +38,31 @@
 - **P0#2 `KvStore::flush()` ✅**：stub 落地——批锁 `mutex_` 内 `wal_.flush()`，与 put/del leader 刷盘同锁序。scratch 验证：SyncMode::No 下 put→flush→不 close 崩溃→重放两键俱在；4 测试全绿。
   - ⚠️ 现状说明：put 的 leader 近期仍每批必刷盘（与 mode_ 无关），故 flush() 此刻与 leader 刷盘冗余，为 README 声明的 `No 交 OS + 手动 flush()` 接口占位，语义待 EverySec/No gate leader 时才能完全体现。
 
+### fsync 三态收口（EverySec 接线）—— 设计定案 ✅（2026-10-15，用户与 Claude 对齐）
+目标：让 README 声明的 fsync 三态为真（对齐 Redis appendfsync Always/EverySec/No）。
+- **目标语义**：`Always`=每批返回前 fsync 完成（现状）；`EverySec`=返回即顶点页缓存、fsync ≤1 次/s；`No`=仅手动 flush()，无自动 fsync。
+- **最小改动**：
+  1. `put()/del()` `[段2]` leader flush 按 mode 分流——`Always` 照旧 `wal_.flush()`；`EverySec`/`No` 跳过（append 已在 `[段1]` `fwrite` 进日志流 C 缓冲；**fsync 频率决定丢失窗口**：EverySec 由定时器 `flush()` 的 fflush+fsync ≤1s 覆盖，No 由手动 `flush()` 覆盖）。
+  2. `[段3]` 散员的兜底 flush 同按 mode 分流（另两态不需要——散员字节已在各自 `[段1]` fwrite 进日志流，由定时器/手动 `flush()` 覆盖）；**drain-to-empty 不变量原样保留**（只挪「是否 flush」这个动作，不挪 drain——散员仍必须被 drain，只是不再补 fsync）。
+  3. `open()`/`close()` 启动/停掉定时器线程（`EverySec` 专属：`std::thread` + `atomic<bool> stop_`，间隔 1s 调现有 `KvStore::flush()`）。
+- **正确性不变式（均不破坏）**：队列空 ⟺ 无等待者；先写盘后改内存（append 恒先上页缓存，内存 apply 在其后）；锁序单向 mutex_→rwmutex_（定时器只抢批锁、不调 put/del → 无 AB-BA）。
+- **put()/del() 返回值语义降级（已接受，Redis 同款）**：`Always` 下为「本批 fsync 成功」；`EverySec`/`No` 下弱化为「已接受进页缓存」。接口注释同步改。
+- **测试判据（确定性、不依赖墙钟，断言行为不测耗时）**：给 Wal 加测试可见计数器 `flush_count`（每 fsync 成功 +1）——`Always`:N put → ≥批次数；`No`:N put → 0，手动 `flush()` 一次 → 1；`EverySec`:put 后立即 0 → sleep 1.2s 后 ≥1。
+- **实现 + 验证 ✅（2026-10-16）**：`[段2]` 门控由用户手写；`[段3]` gate、定时器生命周期（open 启动/close join）、Wal `flush_count` 钩子、`tests/test_sync_mode` 由 Claude 在用户授权下补齐。Windows MinGW 5 测试全绿——test_sync_mode 断言三态 fsync 次数（Always=100、No=0→1、EverySec=0→≥1），无回归。
+
+**EverySec 语义精化 ✅（2026-10-16，P2→定案）**：回答「Sec 模式如何保证先刷后返」时明确——EverySec **不保证**「返回前已落盘」，其担保是「丢窗口 ≤1s」。精化三档水位为**返回到账位**，对齐 Redis `appendfsync everysec`（每命令 write 到页缓存 + 每秒 fsync）：
+- `Always` → `wal_.flush()`（fflush+fsync，返回已到磁盘）
+- `EverySec` → **`wal_.flush_to_os()`**（新方法：仅 fflush 到 OS 页缓存，返回已到 OS；磁盘 fsync 交 1s 定时器）
+- `No` → 跳过（C 缓冲留待手动 `flush()` 的 fflush+fsync）
+- 新增 Wal 钩子 `to_os_count`；`test_sync_mode` 加判据：EverySec 100 put → `to_os_count≥100`（每批到 OS）、`flush_count==0`→睡 1.2s→≥1；No → `to_os_count==0`。6 测试全绿。
+
+### 交接棒重设计（2026-10-16 ✅，替代 [段3] drain-to-empty）
+用户两连击指出 drain 方案的两个结构性问题后重构：① 唤醒方式不对——锁内 notify wrapper 会抢批锁+争 rwmutex_（惊群，组提交的 apply 摊薄失效）；② drain 循环**退化成持续 leader**——持续负载下 leader 无限续期、首批成员饿死、「队列空 ⟺ 无等待者」在持续到达下不可证明。
+- **新机制（定案）**：leader 任期 = 一次快照 + 一次刷盘(仅 Always) + 一把 rwmutex_ 代 apply 全批，**有界**。入队请求只落二态之一——被某任 leader 收进批(→`is_done`) 或 被点名交接(→`promoted`)（下任 leader = 队列最老散员），无双关、无可证性依赖；`worked=false` 仅在队列空时由收尾置。唤醒全部移锁外：成员 `notify_all` + 下任 `notify_one`。
+- **踩坑（已修）**：交接只置 `promoted=true` 不 notify → 被点名者睡死在自己的 cv_ 上（test_concurrency 挂死，现象 = 老版尾孤儿的接班变体）。修复：交接必须连敲门（收尾锁外 `next_leader->cv_.notify_one()`）。
+- **返回值语义一次兑现（plan 下一步#2）**：`put`/`del` 统一走私有 `write(op,key,val)`，`reg->applied` = skiplist 真值（put=true 新增 / del=true 确有移除）；`reg->ok`（fsync 结果）降级为内部字段（Always 真判定，EverySec/No=已接受）。写请求切 3→6 字段：`op/key/val/ok/applied/is_done/promoted`。新增 `tests/test_applied` 断言语义。
+- **验证**：test_concurrency（4×5000）修复后 PASS；6 测试 Windows 全绿（skiplist/kv/recovery/concurrency/sync_mode/applied）。待办：WSL2 TSAN 复跑（新并发面：交接棒 + 定时器并发）——规范轮次在 Linux。
+
 ### 下一步（Day3 收尾）
 1. **WSL2 TSAN 收口 ✅**（2026-10-14 通过：`test_concurrency Passed 42.17s`，TSAN 零数据竞争报告、无挂死）。MinGW g++8.1 无 libtsan；规范轮次在 WSL2 跑（源码 `_WIN32` 分叉已含 POSIX fsync 分支，Linux 可直接编译）：
    ```bash
@@ -50,7 +75,7 @@
    ctest --test-dir build -R test_concurrency --output-on-failure
    ```
    已跑通命令本身。注意 `~/kv-engine-tsan` 是副本，若 `/mnt/f` 再有改动需重新拷/同步。
-2. **put/del 返回值语义**：当前是整批 flush 成功与否（`reg->success`），接口契约「true=新增 / 确有移除」未兑现（方向：WriteRequest 携带 op/key，apply 时记录 insert/erase 真值）。
+2. **put/del 返回值语义 ✅（2026-10-16 交接棒重设计一并兑现）**：接口回 `reg->applied`（put=true 新增 / del=true 确有移除），`reg->ok`（fsync）降级内部；`test_applied` 断言语义。
 3. **close 并发接线**：当前仅 `wal_.close()`；并发下有等待者时应排空/唤醒（现测试在 join 后调 close，无并发 close，暂安全）。
 4. **清理**：`test_concurrency` 关尾部 `remove("concurrency_test.wal")`（WAL 已入 `.gitignore`，可不改）。
 
@@ -218,3 +243,54 @@ class KvStore {
 - 不做 lock-free / 每节点细化（标注为"未来可扩展"，时间紧不动）。
 - 不做磁盘索引（本引擎内存优先；磁盘 B+树是另一门功课）。
 - key/value 均 `std::string`（模板跳表内部通用，门面定 string 即可）。
+
+## 10. TSAN 收口记录（2026-10-16）
+
+**现象**：`test_concurrency` 在 `-fsanitize=thread` 下 83% 挂：4 处 `data race`，全部是
+`pthread_cond_destroy`（`WriteRequest::~WriteRequest`）∥ `pthread_cond_broadcast` /
+`Signal`（`write()` 收尾段），且「内存块 size=144，分配者 = 正在 notify 的 leader 线程自己」。
+
+**排查三连**：
+1. **引用计数分析**：`batch` / `next_leader` 持 `shared_ptr` 期间对象不可能析构；batch 只在本
+   `write()` 返回时销毁。broadcast（锁内）恒早于任何析构。结构上无 UAF 路径。
+2. **ASan+UBSan 16 万次写（8 轮 × 4 线程 × 5000）零错误**：ASan 对 UAF 是确定性检测，
+   若「notify 已销毁对象」为真必有报告。程序 8+ 轮 TSAN/非 TSAN 从不崩溃。
+3. **归因**：libstdc++ 13 的 `std::condition_variable` 用 futex 直接字实现，构造不经
+   `pthread_cond_init` → TSan 感知不到「同一 malloc 地址先 destroy 后复用的新 cv」，
+   把新对象的唤醒读配上旧对象销毁写，属于 shadow 影子误报（`_Sp_counted_ptr_inplace`
+   把对象内联进控制块，加剧地址复用）。
+
+**收敛（根治误报而非压制）**：条件变量本质是通信基础设施，与请求「同生共死」才是错配。
+把每请求一个 `cv_` 升级为 **KvStore 持有的共享门铃**（成员 `cv_`，open 后一次构造、
+close 前无在途写者），等待谓词 `is_done || promoted` 不变，收尾段一次 `cv_.notify_all()`
+锁内广播。多醒者谓词为假 → futex 重睡，不抢 rwmutex_，无惊群；交接由谓词 `promoted`
+承载，广播的一次唤醒天然覆盖被交接者（不再需要单独 `notify_one`）。
+
+**验证**：`test_concurrency` TSAN 5/5 轮零警告（exit 0）；WSL2 ctest 6/6 通过；
+Windows MinGW 6/6 通过。README 的「TSAN 零竞争」从此为真。
+
+## 11. 缓存失效专项 bench（2026-10-16）
+
+**动因**：千万级（10⁷）下 find 效率下降，定性为跳表指针追逐的 Cache Miss。
+**做法**（用户选定「先测后改」）：新增 `bench/bench_cache.cpp`（`kv_bench_cache` target），
+同数据三组对照——跳表 coldfind（随机 key）／ hotfind（8 热 key，cache 友好下限）／
+排序数组二分（cache 友好结构的量化下界），string 短 key（SSO 内，真实 KV 形态）。
+
+**实测**（Windows MinGW g++ 8.1 -O2 / WSL2 g++ 12 两环境趋势一致）：
+
+| N     | cold/op | hot/op | range 吞吐 | array 二分 | 跳表/数组 |
+|-------|---------|--------|-----------|-----------|----------|
+| 1e5   | ~1.2 µs | ~250 ns | ~8 个/µs  | ~290 ns   | 3.7–4.2× |
+| 1e6   | ~2.9 µs | ~350 ns | ~5 个/µs  | ~530 ns   | 4.1–6.0× |
+| 1e7   | ~5.7 µs | ~350 ns | ~3.7 个/µs| ~900 ns   | 5.8–6.8× |
+
+**结论（判据已核验）**：cold 随 10⁵→10⁷ 涨 ~4.7–5×（1e7 ≈ 5.7 µs/op），hot 几乎持平
+（~1.6–2.2×）→ 涨幅全部来自每次指针跳转的主存往返，非算法复杂度；跳表冷查比数组
+二分慢 3.7×→6.8× 且随量级拉开 → 「有序索引＋find 高频＋千万级」三条件齐备时换
+B 树/数组的量化判据。README §④ 已录表 + WSL 复跑锚点 + 判据三句。
+
+**方案状态（2026-10-16 用户决策）**：P2 紧凑节点优化**先停**。高数据量的应对方向改为**「换结构 + 分层级」**——数据量越过阈值后不再让单一跳表硬扛 cache miss，转而采用分层/多级索引。形态待后续明确，候选包括：
+- 内存跳表（热层）＋ 磁盘 B 树（冷层），按数据量/温度分层；
+- Bloom 过滤层拦「不存在」键 + 精查层（呼应 §7 缓存穿透防护）；
+- 或直接切排序数组/B 树（§④ 判据：三条件齐备时换结构）。
+启动判据即 §④ 实测：1e7 冷查 ~5.7 µs/op、比数组二分慢 6.8×。

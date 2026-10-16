@@ -29,7 +29,7 @@ endif()
 
 # ---- 测试（无第三方依赖，手写断言见 tests/test_util.h）----
 enable_testing()
-foreach(t test_skiplist test_kv test_recovery test_concurrency)
+foreach(t test_skiplist test_kv test_recovery test_concurrency test_sync_mode test_applied)
   add_executable(${t} tests/${t}.cpp)
   target_link_libraries(${t} PRIVATE kvcore)
   target_include_directories(${t} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
@@ -41,4 +41,7 @@ option(KV_BUILD_BENCH "Build benchmark" OFF)
 if(KV_BUILD_BENCH)
   add_executable(kv_bench bench/bench.cpp)
   target_link_libraries(kv_bench PRIVATE kvcore)
+  # 缓存失效专项（只依赖 header-only 跳表，link kvcore 仅为继承 include 路径）
+  add_executable(kv_bench_cache bench/bench_cache.cpp)
+  target_link_libraries(kv_bench_cache PRIVATE kvcore)
 endif()
